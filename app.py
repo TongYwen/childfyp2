@@ -501,6 +501,55 @@ def edit_profile():
     return redirect(url_for("profile"))
 
 
+@app.route("/profile/change-password", methods=["POST"])
+@login_required
+def change_password():
+    current_password = request.form.get("current_password", "")
+    new_password = request.form.get("new_password", "")
+    confirm_password = request.form.get("confirm_password", "")
+
+    # Validate all fields are provided
+    if not all([current_password, new_password, confirm_password]):
+        flash("Please fill in all password fields.", "warning")
+        return redirect(url_for("profile"))
+
+    # Verify current password
+    conn = get_db_conn()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT password FROM users WHERE id=%s", (current_user.id,))
+    user = cursor.fetchone()
+
+    if not user or not bcrypt.check_password_hash(user["password"], current_password):
+        cursor.close()
+        conn.close()
+        flash("Current password is incorrect.", "danger")
+        return redirect(url_for("profile"))
+
+    # Check new password matches confirmation
+    if new_password != confirm_password:
+        cursor.close()
+        conn.close()
+        flash("New passwords do not match.", "danger")
+        return redirect(url_for("profile"))
+
+    # Validate password strength
+    if not is_strong_password(new_password):
+        cursor.close()
+        conn.close()
+        flash("Password must be at least 8 characters with uppercase, lowercase, and a special character.", "warning")
+        return redirect(url_for("profile"))
+
+    # Update password
+    hashed_password = bcrypt.generate_password_hash(new_password).decode("utf-8")
+    cursor.execute("UPDATE users SET password=%s WHERE id=%s", (hashed_password, current_user.id))
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+    flash("Password changed successfully.", "success")
+    return redirect(url_for("profile"))
+
+
 @app.route("/profile/child/add", methods=["POST"])
 @login_required
 def add_child():
