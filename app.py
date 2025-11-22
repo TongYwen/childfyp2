@@ -72,6 +72,12 @@ def is_strong_password(password: str) -> bool:
     pattern = r'^(?=.*[a-z])(?=.*[A-Z])(?=.*[^A-Za-z0-9])(?=.{8,})'
     return re.search(pattern, password) is not None
 
+def normalize_role(role):
+    """Normalize role string for comparison (lowercase, stripped)."""
+    if role is None:
+        return None
+    return str(role).strip().lower()
+
 def roles_required(*roles):
     def wrapper(f):
         @wraps(f)
