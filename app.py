@@ -4,6 +4,7 @@ from flask_login import LoginManager, UserMixin, login_user, login_required, log
 from flask_mail import Mail, Message
 from itsdangerous import URLSafeTimedSerializer
 import mysql.connector
+from mysql.connector import pooling
 from datetime import date, datetime
 from config import Config
 from functools import wraps
@@ -13,9 +14,28 @@ import math
 import re
 import os
 from dotenv import load_dotenv
+import logging
+from logging.handlers import RotatingFileHandler
 
 app = Flask(__name__)
 app.config.from_object(Config)
+
+# Configure logging
+if not app.debug:
+    # Create logs directory if it doesn't exist
+    if not os.path.exists('logs'):
+        os.mkdir('logs')
+
+    # File handler with rotation (10MB max, keep 10 backup files)
+    file_handler = RotatingFileHandler('logs/app.log', maxBytes=10240000, backupCount=10)
+    file_handler.setFormatter(logging.Formatter(
+        '%(asctime)s %(levelname)s: %(message)s [in %(pathname)s:%(lineno)d]'
+    ))
+    file_handler.setLevel(logging.INFO)
+    app.logger.addHandler(file_handler)
+
+    app.logger.setLevel(logging.INFO)
+    app.logger.info('ChildGrowth Insights startup')
 
 load_dotenv()
 bcrypt = Bcrypt(app)
@@ -25,7 +45,6 @@ mail = Mail(app)
 serializer = URLSafeTimedSerializer(app.config['SECRET_KEY'])
 
 EMAIL_REGEX = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
-ADMIN_PASSKEY = "child1234"
 
 # -------------- GEMINI + BENCHMARK SETUP --------------
 genai.configure(api_key=app.config['GOOGLE_API_KEY'])
@@ -33,9 +52,32 @@ genai.configure(api_key=app.config['GOOGLE_API_KEY'])
 # Load benchmark dataset once
 BENCHMARK_PATH = "static/data/developmental_milestones.csv"
 benchmark_df = pd.read_csv(BENCHMARK_PATH)
-benchmark_df.columns = [c.strip().capitalize() for c in benchmark_df.columns]  
+benchmark_df.columns = [c.strip().capitalize() for c in benchmark_df.columns]
+
+# Database connection pool
+try:
+    db_pool = pooling.MySQLConnectionPool(
+        pool_name="childgrowth_pool",
+        pool_size=5,
+        pool_reset_session=True,
+        host=app.config['DB_HOST'],
+        user=app.config['DB_USER'],
+        password=app.config['DB_PASS'],
+        database=app.config['DB_NAME']
+    )
+    app.logger.info("Database connection pool created successfully")
+except Exception as e:
+    app.logger.error(f"Failed to create database connection pool: {e}")
+    db_pool = None
 
 def get_db_conn():
+    """Get a database connection from the pool, or create a new one if pool is unavailable."""
+    if db_pool:
+        try:
+            return db_pool.get_connection()
+        except Exception as e:
+            app.logger.error(f"Failed to get connection from pool: {e}")
+    # Fallback to direct connection if pool is unavailable
     return mysql.connector.connect(
         host=app.config['DB_HOST'],
         user=app.config['DB_USER'],
@@ -71,6 +113,26 @@ def is_strong_password(password: str) -> bool:
 
     pattern = r'^(?=.*[a-z])(?=.*[A-Z])(?=.*[^A-Za-z0-9])(?=.{8,})'
     return re.search(pattern, password) is not None
+
+def normalize_role(role: str) -> str:
+    """Normalize role string to lowercase and strip whitespace."""
+    if not role:
+        return ""
+    return role.strip().lower()
+
+# Request logging middleware
+@app.before_request
+def log_request():
+    """Log incoming requests."""
+    if not app.debug:
+        app.logger.info(f"Request: {request.method} {request.path} from {request.remote_addr}")
+
+@app.after_request
+def log_response(response):
+    """Log outgoing responses."""
+    if not app.debug:
+        app.logger.info(f"Response: {response.status_code} for {request.method} {request.path}")
+    return response
 
 def roles_required(*roles):
     def wrapper(f):
@@ -114,7 +176,7 @@ def register():
             if not admin_passkey:
                 flash("Admin passkey is required for admin registrations.", "warning")
                 return redirect(url_for('register'))
-            if admin_passkey != ADMIN_PASSKEY:
+            if admin_passkey != app.config['ADMIN_PASSKEY']:
                 flash("Invalid admin passkey.", "danger")
                 return redirect(url_for('register'))
         
@@ -125,10 +187,16 @@ def register():
             cursor.execute("INSERT INTO users (name, email, password, role) VALUES (%s,%s,%s,%s)",
                            (name, email, hashed, role))
             conn.commit()
+            app.logger.info(f"New user registered: {email} with role {role}")
             flash("Registration successful. Please log in.", "success")
             return redirect(url_for('login'))
         except mysql.connector.errors.IntegrityError:
+            app.logger.warning(f"Registration attempt with existing email: {email}")
             flash("Email already registered.", "danger")
+            return redirect(url_for('register'))
+        except Exception as e:
+            app.logger.error(f"Registration error for {email}: {e}")
+            flash("An error occurred during registration.", "danger")
             return redirect(url_for('register'))
         finally:
             cursor.close(); conn.close()
@@ -147,8 +215,10 @@ def login():
         if user and bcrypt.check_password_hash(user['password'], password):
             user_obj = User(user['id'], user['name'], user['email'], user['role'])
             login_user(user_obj)
+            app.logger.info(f"User logged in: {email}")
             flash("Logged in successfully.", "success")
             return redirect(url_for('profile'))
+        app.logger.warning(f"Failed login attempt for email: {email}")
         flash("Invalid credentials.", "danger")
         return redirect(url_for('login'))
     return render_template('login.html')
@@ -418,8 +488,6 @@ def edit_test(test_id):
     question_texts = request.form.getlist("questions_text[]")
     question_types = request.form.getlist("questions_type[]")
 
-    print(question_texts)
-
     conn = get_db_conn()
     cursor = conn.cursor()
 
@@ -527,7 +595,6 @@ def add_child():
 @app.route("/profile/child/delete/<int:child_id>", methods=["POST"])
 @login_required
 def delete_child(child_id):
-    print("here")
     conn = get_db_conn()
     cursor = conn.cursor()
     cursor.execute("DELETE FROM children WHERE id=%s AND parent_id=%s", (child_id, current_user.id))
@@ -757,11 +824,10 @@ def preschool_tracker():
                 - Areas that are advanced for the child's age
 
                 Follow the below rules strictly:
-                - End with a one-sentence summary of overall development progress. 
-                - Provide the summary in HTML styled. 
+                - End with a one-sentence summary of overall development progress.
+                - Provide the summary in HTML styled.
                 - Do not self introduce yourself.
                 """
-                print(prompt)
 
                 model = genai.GenerativeModel("gemini-2.5-flash")
                 response = model.generate_content(prompt)
@@ -1035,14 +1101,12 @@ def learning_style():
             Finally, list 3–5 actionable suggestions for parent to support this learning style effectively.
             Keep the tone positive and easy to understand.
             Follow the below rules strictly:
-            - Provide the summary in HTML stlyed. 
+            - Provide the summary in HTML stlyed.
             - Do not self introduced yourself.
             """
-            print(prompt)
             model = genai.GenerativeModel("gemini-2.5-flash")
             response = model.generate_content(prompt)
             benchmark_summary = response.text.strip()
-            print(benchmark_summary)
             # Update or insert result
             if cached:
                 cursor.execute("""
@@ -1116,8 +1180,6 @@ def get_test_questions(test_id):
 def take_learning_test(child_id):
     conn = get_db_conn()
     cursor = conn.cursor()
-
-    print(child_id)
 
     test_id = request.form.get("test_id")
     if not test_id:
@@ -1830,4 +1892,6 @@ def index():
     return redirect(url_for("login"))
     
 if __name__ == '__main__':
-    app.run(debug=True, use_reloader=True)
+    # Use environment variable to control debug mode (default: False for production)
+    debug_mode = os.getenv('FLASK_DEBUG', 'False').lower() == 'true'
+    app.run(debug=debug_mode, host='0.0.0.0', port=5000)
